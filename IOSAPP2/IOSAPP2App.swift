@@ -1,15 +1,15 @@
 import SwiftUI
 import PhotosUI
 
-// MARK: - MODEL & STORE
+// MARK: - MODEL
 
-/// A single scavenger-hunt target
+/// Represents a single scavenger-hunt target.
 struct HuntItem: Identifiable, Hashable, Codable {
     let id: UUID
     var title: String
     var hint: String
     var found: Bool
-    var photoData: Data?
+    var photoData: Data?      // stores the photo user selects
 
     init(id: UUID = UUID(), title: String, hint: String, found: Bool = false, photoData: Data? = nil) {
         self.id = id
@@ -20,7 +20,10 @@ struct HuntItem: Identifiable, Hashable, Codable {
     }
 }
 
-/// App-wide store (shared using EnvironmentObject)
+// MARK: - DATA STORE
+
+/// Shared app data (items & user progress)
+@MainActor
 final class HuntStore: ObservableObject {
     @Published var items: [HuntItem] = [
         .init(title: "City Bookstore",   hint: "Find the aisle with local authors."),
@@ -39,12 +42,14 @@ final class HuntStore: ObservableObject {
     var allFound: Bool { foundCount == items.count }
     var hasDiscount: Bool { foundCount >= 7 }
 
+    /// Mark an item as found & save optional photo
     func markFound(_ item: HuntItem, photoData: Data?) {
         guard let idx = items.firstIndex(of: item) else { return }
         items[idx].found = true
         items[idx].photoData = photoData
     }
 
+    /// Reset all progress
     func resetAll() {
         for i in items.indices {
             items[i].found = false
@@ -53,7 +58,7 @@ final class HuntStore: ObservableObject {
     }
 }
 
-// MARK: - MAIN APP
+// MARK: - APP ENTRY
 
 @main
 struct iOSApp2App: App {
@@ -65,7 +70,7 @@ struct iOSApp2App: App {
     }
 }
 
-// MARK: - MAIN VIEW
+// MARK: - MAIN LIST VIEW
 
 struct ContentView: View {
     @EnvironmentObject private var store: HuntStore
@@ -83,7 +88,9 @@ struct ContentView: View {
                                 StatusDot(found: item.found)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(item.title).font(.headline)
-                                    Text(item.hint).font(.subheadline).foregroundStyle(.secondary)
+                                    Text(item.hint)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 if item.found { Image(systemName: "checkmark.seal.fill").foregroundStyle(.green) }
@@ -119,6 +126,7 @@ struct ContentView: View {
 
 // MARK: - SUBVIEWS
 
+/// Small status dot indicating found/not found
 struct StatusDot: View {
     let found: Bool
     var body: some View {
@@ -127,6 +135,7 @@ struct StatusDot: View {
     }
 }
 
+/// Banner showing rewards based on progress
 struct RewardBanner: View {
     @EnvironmentObject private var store: HuntStore
     var body: some View {
@@ -147,7 +156,7 @@ struct RewardBanner: View {
     }
 }
 
-// MARK: - DETAIL VIEW WITH CARD FLIP + PHOTO PICKER
+// MARK: - ITEM DETAIL VIEW
 
 struct ItemDetailView: View {
     @EnvironmentObject private var store: HuntStore
@@ -157,8 +166,13 @@ struct ItemDetailView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var pickedImageData: Data?
 
+    private var currentItem: HuntItem {
+        store.items.first(where: { $0.id == item.id }) ?? item
+    }
+
     var body: some View {
         VStack(spacing: 16) {
+            // Flip card between details & photo
             ZStack {
                 CardFront(title: item.title, hint: item.hint, found: currentItem.found)
                     .opacity(flipped ? 0 : 1)
@@ -171,13 +185,15 @@ struct ItemDetailView: View {
             .contentShape(Rectangle())
             .onTapGesture { withAnimation(.spring()) { flipped.toggle() } }
 
-            PhotosPicker(selection: $selectedPhoto, matching: .images, preferredItemEncoding: .automatic) {
+            // Photo Picker
+            PhotosPicker(selection: $selectedPhoto, matching: .images) {
                 Label(currentItem.found ? "Update Photo" : "Pick/Take Photo", systemImage: "camera.fill")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .onChange(of: selectedPhoto) { _, newValue in Task { await loadPickedPhoto(newValue) } }
 
+            // Mark as found button
             Button {
                 store.markFound(currentItem, photoData: pickedImageData ?? currentItem.photoData)
             } label: {
@@ -195,10 +211,6 @@ struct ItemDetailView: View {
         .onAppear { pickedImageData = currentItem.photoData }
     }
 
-    private var currentItem: HuntItem {
-        store.items.first(where: { $0.id == item.id }) ?? item
-    }
-
     private func loadPickedPhoto(_ item: PhotosPickerItem?) async {
         guard let item else { return }
         if let data = try? await item.loadTransferable(type: Data.self) {
@@ -206,6 +218,8 @@ struct ItemDetailView: View {
         }
     }
 }
+
+// MARK: - CARD VIEWS
 
 private struct CardFront: View {
     let title: String
