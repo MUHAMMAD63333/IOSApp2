@@ -1,76 +1,190 @@
 import SwiftUI
 import PhotosUI
+import CoreLocation
 
+// =====================================================
 // MARK: - MODEL
+// =====================================================
 
-/// Represents a single scavenger-hunt target.
 struct HuntItem: Identifiable, Hashable, Codable {
     let id: UUID
     var title: String
     var hint: String
-    var found: Bool
-    var photoData: Data?      // stores the photo user selects
 
-    init(id: UUID = UUID(), title: String, hint: String, found: Bool = false, photoData: Data? = nil) {
+    var found: Bool
+    var photoData: Data?
+    var foundAt: Date?
+    var address: String?
+
+    init(id: UUID = UUID(),
+         title: String,
+         hint: String,
+         found: Bool = false,
+         photoData: Data? = nil,
+         foundAt: Date? = nil,
+         address: String? = nil) {
         self.id = id
         self.title = title
         self.hint = hint
         self.found = found
         self.photoData = photoData
+        self.foundAt = foundAt
+        self.address = address
     }
 }
 
-// MARK: - DATA STORE
+// =====================================================
+// MARK: - DATA STORE (with simple JSON persistence)
+// =====================================================
 
-/// Shared app data (items & user progress)
 @MainActor
 final class HuntStore: ObservableObject {
-    @Published var items: [HuntItem] = [
-        .init(title: "City Bookstore",   hint: "Find the aisle with local authors."),
-        .init(title: "Main Street Café", hint: "Smells like fresh croissants at 8am."),
-        .init(title: "Riverside Park",   hint: "Near the big fountain."),
-        .init(title: "Museum Lobby",     hint: "Stand by the dinosaur."),
-        .init(title: "Cinema Lobby",     hint: "Poster wall of classic films."),
-        .init(title: "City Hall",        hint: "Look for the statue out front."),
-        .init(title: "Ice Cream Shop",   hint: "Blue bench by the door."),
-        .init(title: "Tech Hub",         hint: "Cowork space on 2nd floor."),
-        .init(title: "Art Gallery",      hint: "Red abstract piece in entry."),
-        .init(title: "Train Station",    hint: "Platform 2 timetable.")
-    ]
+    @Published var items: [HuntItem] = [] {
+        didSet { save() }
+    }
+
+    private let fileURL: URL = {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        return dir.appendingPathComponent("hunt.json")
+    }()
+
+    init() {
+        if !load() {
+            // Seed default items if no saved data
+            items = [
+                .init(title: "City Bookstore",   hint: "Find the aisle with local authors."),
+                .init(title: "Main Street Café", hint: "Smells like fresh croissants at 8am."),
+                .init(title: "Riverside Park",   hint: "Near the big fountain."),
+                .init(title: "Museum Lobby",     hint: "Stand by the dinosaur."),
+                .init(title: "Cinema Lobby",     hint: "Poster wall of classic films."),
+                .init(title: "City Hall",        hint: "Look for the statue out front."),
+                .init(title: "Ice Cream Shop",   hint: "Blue bench by the door."),
+                .init(title: "Tech Hub",         hint: "Cowork space on 2nd floor."),
+                .init(title: "Art Gallery",      hint: "Red abstract piece in entry."),
+                .init(title: "Train Station",    hint: "Platform 2 timetable.")
+            ]
+            save()
+        }
+    }
 
     var foundCount: Int { items.filter(\.found).count }
     var allFound: Bool { foundCount == items.count }
     var hasDiscount: Bool { foundCount >= 7 }
 
-    /// Mark an item as found & save optional photo
-    func markFound(_ item: HuntItem, photoData: Data?) {
-        guard let idx = items.firstIndex(of: item) else { return }
-        items[idx].found = true
-        items[idx].photoData = photoData
+    func markFound(_ item: HuntItem, photoData: Data?, address: String?) {
+        guard let i = items.firstIndex(where: { $0.id == item.id }) else { return }
+        items[i].found = true
+        items[i].foundAt = Date()
+        items[i].photoData = photoData
+        items[i].address = address
     }
 
-    /// Reset all progress
+    func removePhoto(_ item: HuntItem) {
+        guard let i = items.firstIndex(where: { $0.id == item.id }) else { return }
+        items[i].photoData = nil
+        // keep found status; if you want to unmark, set found=false and clear foundAt/address
+    }
+
     func resetAll() {
         for i in items.indices {
             items[i].found = false
             items[i].photoData = nil
+            items[i].foundAt = nil
+            items[i].address = nil
+        }
+    }
+
+    private func save() {
+        do {
+            let data = try JSONEncoder().encode(items)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            print("Save error:", error.localizedDescription)
+        }
+    }
+
+    @discardableResult
+    private func load() -> Bool {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return false }
+        do {
+            let data = try Data(contentsOf: fileURL)
+            items = try JSONDecoder().decode([HuntItem].self, from: data)
+            return true
+        } catch {
+            print("Load error:", error.localizedDescription)
+            return false
         }
     }
 }
 
-// MARK: - APP ENTRY
+// =====================================================
+// MARK: - LOCATION SERVICE
+// =====================================================
+
+final class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
+    private let manager = CLLocationManager()
+    private let geocoder = CLGeocoder()
+
+    @Published var lastLocation: CLLocation?
+    @Published var lastAddress: String?
+
+    override init() {
+        super.init()
+        manager.delegate = self
+    }
+
+    func requestAuthIfNeeded() {
+        if manager.authorizationStatus == .notDetermined {
+            manager.requestWhenInUseAuthorization()
+        }
+    }
+
+    func captureAddress() {
+        requestAuthIfNeeded()
+        manager.requestLocation()
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        print("Location error:", error.localizedDescription)
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let loc = locations.last else { return }
+        DispatchQueue.main.async { self.lastLocation = loc }
+
+        geocoder.reverseGeocodeLocation(loc) { [weak self] placemarks, _ in
+            guard let self else { return }
+            let p = placemarks?.first
+            let line1 = [p?.subThoroughfare, p?.thoroughfare].compactMap { $0 }.joined(separator: " ")
+            let line2 = [p?.locality, p?.administrativeArea].compactMap { $0 }.joined(separator: ", ")
+            let line3 = p?.postalCode ?? ""
+            let addr = [line1, line2, line3].filter { !$0.isEmpty }.joined(separator: " • ")
+            DispatchQueue.main.async { self.lastAddress = addr.isEmpty ? nil : addr }
+        }
+    }
+}
+
+// =====================================================
+// MARK: - APP
+// =====================================================
 
 @main
-struct iOSApp2App: App {
+struct IOSApp2App: App {
     @StateObject private var store = HuntStore()
+    @StateObject private var location = LocationService()
+
     var body: some Scene {
         WindowGroup {
-            ContentView().environmentObject(store)
+            ContentView()
+                .environmentObject(store)
+                .environmentObject(location)
         }
     }
 }
 
+// =====================================================
 // MARK: - MAIN LIST VIEW
+// =====================================================
 
 struct ContentView: View {
     @EnvironmentObject private var store: HuntStore
@@ -93,7 +207,9 @@ struct ContentView: View {
                                         .foregroundStyle(.secondary)
                                 }
                                 Spacer()
-                                if item.found { Image(systemName: "checkmark.seal.fill").foregroundStyle(.green) }
+                                if item.found {
+                                    Image(systemName: "checkmark.seal.fill").foregroundStyle(.green)
+                                }
                             }
                             .padding(.vertical, 6)
                         }
@@ -119,14 +235,13 @@ struct ContentView: View {
             .alert("Reset progress?", isPresented: $showResetConfirm) {
                 Button("Cancel", role: .cancel) {}
                 Button("Reset", role: .destructive) { store.resetAll() }
-            } message: { Text("This will clear all photos and marks.") }
+            } message: {
+                Text("This will clear all photos, timestamps, and addresses.")
+            }
         }
     }
 }
 
-// MARK: - SUBVIEWS
-
-/// Small status dot indicating found/not found
 struct StatusDot: View {
     let found: Bool
     var body: some View {
@@ -135,7 +250,6 @@ struct StatusDot: View {
     }
 }
 
-/// Banner showing rewards based on progress
 struct RewardBanner: View {
     @EnvironmentObject private var store: HuntStore
     var body: some View {
@@ -156,10 +270,14 @@ struct RewardBanner: View {
     }
 }
 
-// MARK: - ITEM DETAIL VIEW
+// =====================================================
+// MARK: - DETAIL VIEW
+// =====================================================
 
 struct ItemDetailView: View {
     @EnvironmentObject private var store: HuntStore
+    @EnvironmentObject private var location: LocationService
+
     let item: HuntItem
 
     @State private var flipped = false
@@ -171,55 +289,83 @@ struct ItemDetailView: View {
     }
 
     var body: some View {
-        VStack(spacing: 16) {
-            // Flip card between details & photo
-            ZStack {
-                CardFront(title: item.title, hint: item.hint, found: currentItem.found)
-                    .opacity(flipped ? 0 : 1)
-                    .rotation3DEffect(.degrees(flipped ? 180 : 0), axis: (x: 0, y: 1, z: 0))
-                CardBack(imageData: currentItem.photoData)
-                    .opacity(flipped ? 1 : 0)
-                    .rotation3DEffect(.degrees(flipped ? 0 : -180), axis: (x: 0, y: 1, z: 0))
-            }
-            .frame(height: 260)
-            .contentShape(Rectangle())
-            .onTapGesture { withAnimation(.spring()) { flipped.toggle() } }
+        ScrollView {
+            VStack(spacing: 16) {
+                ZStack {
+                    CardFront(title: currentItem.title,
+                              hint: currentItem.hint,
+                              found: currentItem.found)
+                        .opacity(flipped ? 0 : 1)
+                        .rotation3DEffect(.degrees(flipped ? 180 : 0), axis: (x: 0, y: 1, z: 0))
+                    CardBack(imageData: currentItem.photoData)
+                        .opacity(flipped ? 1 : 0)
+                        .rotation3DEffect(.degrees(flipped ? 0 : -180), axis: (x: 0, y: 1, z: 0))
+                }
+                .frame(height: 260)
+                .contentShape(Rectangle())
+                .onTapGesture { withAnimation(.spring()) { flipped.toggle() } }
 
-            // Photo Picker
-            PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                Label(currentItem.found ? "Update Photo" : "Pick/Take Photo", systemImage: "camera.fill")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .onChange(of: selectedPhoto) { _, newValue in Task { await loadPickedPhoto(newValue) } }
+                PhotosPicker(selection: $selectedPhoto, matching: .images, preferredItemEncoding: .automatic) {
+                    Label(currentItem.photoData == nil ? "Pick/Take Photo" : "Change Photo",
+                          systemImage: "camera.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .onChange(of: selectedPhoto) { _, newValue in
+                    // Trigger location capture and load photo
+                    location.captureAddress()
+                    Task {
+                        if let data = try? await newValue?.loadTransferable(type: Data.self) {
+                            pickedImageData = data
+                        }
+                    }
+                }
 
-            // Mark as found button
-            Button {
-                store.markFound(currentItem, photoData: pickedImageData ?? currentItem.photoData)
-            } label: {
-                Label(currentItem.found ? "Marked as Found" : "Mark as Found", systemImage: "checkmark.seal.fill")
-                    .frame(maxWidth: .infinity)
-            }
-            .disabled(currentItem.found == false && pickedImageData == nil)
-            .buttonStyle(.bordered)
+                HStack {
+                    Button {
+                        store.markFound(currentItem,
+                                        photoData: pickedImageData ?? currentItem.photoData,
+                                        address: location.lastAddress)
+                    } label: {
+                        Label(currentItem.found ? "Marked as Found" : "Mark as Found",
+                              systemImage: "checkmark.seal.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .disabled((currentItem.found == false) && (pickedImageData == nil))
+                    .buttonStyle(.bordered)
 
-            Spacer()
+                    Button(role: .destructive) {
+                        store.removePhoto(currentItem)
+                        pickedImageData = nil
+                    } label: {
+                        Label("Remove Photo", systemImage: "trash")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .disabled(currentItem.photoData == nil)
+                    .buttonStyle(.bordered)
+                }
+
+                if let ts = currentItem.foundAt {
+                    Text("Found: \(ts.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if let addr = currentItem.address, !addr.isEmpty {
+                    Text("Address: \(addr)")
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding()
         }
-        .padding()
         .navigationTitle("Details")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { pickedImageData = currentItem.photoData }
-    }
-
-    private func loadPickedPhoto(_ item: PhotosPickerItem?) async {
-        guard let item else { return }
-        if let data = try? await item.loadTransferable(type: Data.self) {
-            pickedImageData = data
+        .onAppear {
+            pickedImageData = currentItem.photoData
         }
     }
 }
-
-// MARK: - CARD VIEWS
 
 private struct CardFront: View {
     let title: String
